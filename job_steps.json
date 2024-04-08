@@ -1,0 +1,9 @@
+{
+    "server_ip": "localhost",
+    "environment": "macbook",
+    "job_steps": [
+      "01_motioncorr_mpi.sh",
+      "02_tomo_recon_mpi.sh"
+    ],
+    "num_job_steps": 2
+  }
