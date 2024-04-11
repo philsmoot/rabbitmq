@@ -1,46 +1,41 @@
 import pika
 import sys
 import os
-import time
 import json
 import subprocess
 
-def launch_shell_job(command):
-    # Launch the command in a shell
-    shell_command = "./" + command
-    process = subprocess.Popen(shell_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    
-    # Wait for the command to complete and capture output
-    stdout, stderr = process.communicate()
-    
-    print("launch_shell_job" + shell_command)
-    # Print the output
-    print("Standard Output:")
-    print(stdout.decode())
-    print("Standard Error:")
-    print(stderr.decode())
+def launch_shell_job(filepath, command):
+    shell_command = filepath + '/' + command
+    print("[launch_shell_job() command = " + shell_command)
+    try:
+        process = subprocess.Popen(shell_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        print("launch_shell_job failed")
+        stdout, stderr = process.communicate()
+        print("[launch_shell_job] Standard Output:" + stdout.decode())
+        print("[launch_shell_job] Standard Error:" + stderr.decode())
+   
+def queue_msg(mq_server, message):    
+    try:
+        connection = pika.BlockingConnection(pika.ConnectionParameters(mq_server))
+        channel = connection.channel()
 
-def queue_msg(mq_server, message):
-    
-    connection = pika.BlockingConnection(pika.ConnectionParameters(mq_server))
-    channel = connection.channel()
+        #! create or ensure the "task" queue exists
+        channel.queue_declare(queue='task_queue', durable=True)
 
-    #! create or ensure the "task" queue exists
-    channel.queue_declare(queue='task_queue', durable=True)
+        #! publish message
+        channel.basic_publish(exchange='',
+                        routing_key='task_queue',
+                        body=message,
+                        properties=pika.BasicProperties(
+                        delivery_mode=pika.DeliveryMode.Persistent))
 
-    #! publish message
-    channel.basic_publish(exchange='',
-                    routing_key='task_queue',
-                    body=message,
-                    properties=pika.BasicProperties(
-                    delivery_mode=pika.DeliveryMode.Persistent))
+        #! make sure network buffers are flushed and message was delivered
+        connection.close()
+        print("[queue_msg()] Enqueue message = " + message)
 
-    print(" [x] Enqueue message = " + message)
-
-    #! TODO check return to make sure call successed
-
-    #! make sure network buffers are flushed and message was delivered
-    connection.close()
+    except pika.exceptions.AMQPError as e:
+        print(f"Failed to deliver message: {e}")
 
 def read_server_config(file_path):
     try:
@@ -61,6 +56,9 @@ def parse_json(json_data):
         
         # Extract environment
         environment = json_data.get("environment")
+
+        # Extract pathname
+        filepath = json_data.get("filepath")
         
         # Extract job steps
         job_steps = json_data.get("job_steps")
@@ -68,45 +66,51 @@ def parse_json(json_data):
         # Extract number of job steps
         num_job_steps = json_data.get("num_job_steps")
         
-        return server_ip, environment, job_steps, num_job_steps
+        return server_ip, environment, filepath, job_steps, num_job_steps
     else:
-        return None, None, None, None
+        return None, None, None, None, None
     
-def act_on_message(message, current_step, next_step):
+def act_on_message(mq_server, message, job_steps, num_job_steps, filepath):
+    #!
     #! messages can look like:
-    #! msg_taskname_queued
-    #! msg_taskname_started
-    #! msg_taskname_done
+    #! task_queued
+    #! task_started
+    #! task_done
+    #!
+    #! launch a the job step if the task is "queued"
+    #! if a task is "done" and there is another task to be completed, queue the next task
+    #! else no operation for the message 
 
-    if message == "msg_" + current_step + "_queued":
-        launch_shell_job(current_step)
-        return 1
-    elif message == "msg_" + current_step + "_done":
-        queue_msg("msg_" + next_step + "_queued")
-        return 0
-    else:
-        print ("message not handled" + message)
-        return 0
-
+    index =  0
+    for entry in job_steps:
+        index +=1
+        if message == entry + "_queued":
+            launch_shell_job(filepath, entry)
+        if message == entry + "_done":
+            if index < num_job_steps:
+               queue_msg(mq_server, job_steps[index] + "_queued") 
+     
+ 
 def main():
 
     if len(sys.argv) != 2:
         print("Usage: python3 dojob.py <path_to_json_file>")
-        #! hack for now, we should exit...
-        file_path = "./job_steps.json"
+        print("Default config file is ./job_steps.json")
+        config_file = "./job_steps.json"
     else:
-        file_path = sys.argv[1]
+        config_file = sys.argv[1]
     
     # Read JSON file
-    server_config = read_server_config(file_path)
+    server_config = read_server_config(config_file)
     
     # Parse JSON data
-    server_ip, environment, job_steps, num_job_steps = parse_json(server_config)
-    current_job_index = 0
+    mq_server, environment, filepath, job_steps, num_job_steps = parse_json(server_config)
     
-    if server_ip is not None:
-        print(f"Server IP Address: {server_ip}")
+    if mq_server is not None:
+        print("dojob.py configuration")
+        print(f"Server IP Address: {mq_server}")
         print(f"Environment: {environment}")
+        print(f"Filepath: {filepath}")
         print("Job Steps:")
         for step in job_steps:
             print(step)
@@ -114,33 +118,31 @@ def main():
     else:
         print("No server configuration extracted.")
 
-    connection = pika.BlockingConnection(pika.ConnectionParameters(server_ip))
-    channel = connection.channel()
+    try:
+        connection = pika.BlockingConnection(pika.ConnectionParameters(mq_server))
+        channel = connection.channel()
+        #! make sure the 'task_queue' exists
+        channel.queue_declare(queue='task_queue', durable=True)
+    except pika.exceptions.AMQPError as e:
+        print(f"main() failed to connect to mq_server: {e}")
 
-    channel.queue_declare(queue='task_queue', durable=True)
-
+    #! the callback function is called when a message is queued
     def callback(ch, method, properties, body):
-        print(f" [x] Dequeue message = {body.decode()}")
+        print(f"[callback] Dequeue message = {body.decode()}")
         message = str(f"{body.decode()}")
         ch.basic_ack(delivery_tag=method.delivery_tag)
-    
-        if current_job_index < num_job_steps:
-            current_step = job_steps[current_job_index]
-            if current_job_index < num_job_steps - 1:
-                next_step = job_steps[current_job_index + 1]
-            else:
-                next_step = ""
-        if (act_on_message(message, current_step, next_step) == 1):
-            current_job_index = current_job_index + 1
+        act_on_message(mq_server, message, job_steps, num_job_steps, filepath)   
         return
     
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(queue='task_queue', on_message_callback=callback)
 
-    current_step = job_steps[current_job_index]
-    queue_msg(server_ip, "msg_" + current_step + "_queued")
+    print('[*] Waiting for messages. To exit press CTRL+C')
 
-    print(' [*] Waiting for messages. To exit press CTRL+C')
+    #! initialize queue with the first task
+    first_step = job_steps[0]
+    queue_msg(mq_server, first_step + "_queued")
+
     channel.start_consuming()
 
 
